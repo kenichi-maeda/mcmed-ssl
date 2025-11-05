@@ -179,8 +179,12 @@ class MetaModel():
 
     def forward(self, batch):
         for k, value in batch.items(): 
-            if k != 'pt_ids':
-                batch[k]=value.float().to(self.device)
+            if not isinstance(value, torch.Tensor):
+                continue
+            if k in ("pt_ids", "end_idx", "ed_dispo"):  # keep integer fields
+                batch[k] = value.to(self.device)
+            else:
+                batch[k] = value.float().to(self.device)
 
         signal = batch['signals_timeseries']
 

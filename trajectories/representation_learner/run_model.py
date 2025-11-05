@@ -365,26 +365,53 @@ def train_meta_model(
 def do_eval(model, dl):
     model.eval()
     all_res = {}
-    eval_tasks = []
-    for i, batch in enumerate(dl):
-        with torch.no_grad():
-            _, _, all_outputs, _ = model.forward(batch)
-        proc_output = {}
-        for task,(logit, label, loss) in all_outputs.items():
-            if i == 0:
-                eval_tasks.append(task)
-            proc_output[f'{task}_logit'] = logit
-            proc_output[f'{task}_label'] = label
-            proc_output[f'{task}_loss'] = loss
-        all_res = update_lossdict(all_res, proc_output)
-    
-    # Now each element of all_res is either a list of floats or a list of np arrs
-    # Compute some key metrics
-    if 'example_task' in eval_tasks:
-        preds = np.concatenate(all_res['example_task_logit'])[:,1]
-        labels = np.concatenate(all_res['example_task_label'])
-        all_res['example_task_auc'] = roc_auc_score(labels, preds)
-        all_res['example_task_auprc'] = average_precision_score(labels, preds)   
+    if dl is None:
+        return all_res
+
+    with torch.no_grad():
+        for i, batch in enumerate(dl):
+            _, _, all_outputs, _ = model.forward(batch)   # dict: task -> (logits, labels, loss)
+
+            # collect tensors per task across batches
+            to_log = {}
+            for task, (logits, labels, loss) in all_outputs.items():
+                to_log[f'{task}_logit'] = logits
+                to_log[f'{task}_label'] = labels
+                to_log[f'{task}_loss']  = loss
+            all_res = update_lossdict(all_res, to_log)
+
+    # compute metrics per task if possible
+    for key in list(all_res.keys()):
+        if not key.endswith('_logit'):
+            continue
+        task = key[:-6]  # strip "_logit"
+
+        logits_list = all_res.get(f'{task}_logit', [])
+        labels_list = all_res.get(f'{task}_label', [])
+        if not logits_list or not labels_list:
+            continue
+
+        logits = np.concatenate(logits_list, axis=0)
+        labels = np.concatenate(labels_list, axis=0)
+
+        # convert logits -> positive-class scores
+        if logits.ndim == 2 and logits.shape[1] == 2:
+            scores = logits[:, 1]
+        else:
+            # single logit -> sigmoid
+            scores = 1.0 / (1.0 + np.exp(-logits.reshape(-1)))
+
+        # need both classes to compute AUC/AUPRC
+        if len(np.unique(labels)) < 2:
+            continue
+
+        try:
+            all_res[f'{task}_auc']   = roc_auc_score(labels, scores)
+            all_res[f'{task}_auprc'] = average_precision_score(labels, scores)
+        except Exception:
+            # leave metrics absent if something goes wrong
+            pass
+
     return all_res
 
 
@@ -437,19 +464,37 @@ def load_datasets(args, task='ssl'):
             datasets[split] = None
             continue
 
+        # choose the split CSV per split
+        use_splits = None
+        if split == 'train' and hasattr(args, 'use_splits_train'):
+            use_splits = args.use_splits_train
+        elif split == 'tuning' and hasattr(args, 'use_splits_val'):
+            use_splits = args.use_splits_val
+        elif split == 'test' and hasattr(args, 'use_splits_test'):
+            use_splits = args.use_splits_test
+
         datasets[split] = PatientDataset(task=task, 
                                          base_dir=args.dataset_dir, 
+                                         parquet_path=args.parquet_path,      # aligned parquet path
+                                         use_splits=use_splits,               # CSV for that split
                                          split=split_map[split],  
+
                                          min_seq_len=args.min_seq_len,
                                          max_seq_len=args.max_seq_len,
                                          eval_seq_len=args.eval_seq_len,
+                                         ssl_stride=args.ssl_stride if (task=='ssl' and hasattr(args,'ssl_stride')) else 1,
+
                                          signal_seconds=args.signal_seconds,
                                          signal_mask=args.signal_mask,
                                          history_cutout_prob=args.history_cutout_prob,
                                          history_cutout_frac=args.history_cutout_frac,
                                          spatial_dropout_rate=args.spatial_dropout_rate, 
                                          corrupt_rate=args.corrupt_rate,
-                                         length=args.train_windows_per_epoch if split == 'train' else 1000,
+
+                                         standardize_structured=False,
+                                         standardize_statics=False,
+                                         norm_json=None,   # don’t save/load stats for SSL
+                                         verbose=(split=='train')
                                         )
         datasets[split].train_tune_test = split
         if split == 'train':
@@ -460,44 +505,62 @@ def load_datasets(args, task='ssl'):
 def setup_datasets_and_dataloaders(args, task='ssl'):
     datasets = load_datasets(args, task=task)
 
-    if not args.do_train: 
-        return datasets
+    if not args.do_train:
+        return datasets, None, None, None
 
-    sampler = RandomSampler(datasets['train'])
+    # For pretraining, draw a fixed number of windows per epoch, with replacement.
+    if task == 'ssl' and hasattr(args, 'train_windows_per_epoch') and args.train_windows_per_epoch:
+        train_sampler = RandomSampler(
+            datasets['train'],
+            replacement=True,
+            num_samples=args.train_windows_per_epoch
+        )
+    else:
+        train_sampler = RandomSampler(datasets['train'])
 
     train_dataloader = DataLoader(
-        datasets['train'], sampler=sampler, batch_size=args.batch_size,
-        num_workers=args.num_dataloader_workers, pin_memory=True)
+        datasets['train'],
+        sampler=train_sampler,
+        batch_size=args.batch_size,
+        num_workers=args.num_dataloader_workers,
+        pin_memory=True
+    )
+
     if task == 'ssl':
         val_dataloader = None
-        if args.do_eval_tuning:
+        if args.do_eval_tuning and datasets.get('tuning') is not None:
             val_dataloader = DataLoader(
-                datasets['tuning'], batch_size=args.batch_size,
-                num_workers=args.num_dataloader_workers, pin_memory=True)
+                datasets['tuning'],
+                batch_size=args.batch_size,
+                num_workers=args.num_dataloader_workers,
+                pin_memory=True
+            )
         return datasets, train_dataloader, val_dataloader, None
-    else:
-        # If we're in a FT run, return dataloaders for val and test too.
-        val_dataloader = DataLoader(
-            datasets['tuning'], batch_size=args.batch_size,
-            num_workers=args.num_dataloader_workers, pin_memory=True)
-        test_dataloader = DataLoader(
-            datasets['test'], batch_size=args.batch_size,
-            num_workers=args.num_dataloader_workers, pin_memory=True)
-        return datasets, train_dataloader, val_dataloader, test_dataloader
+
+    # FT path unchanged
+    val_dataloader = DataLoader(
+        datasets['tuning'], batch_size=args.batch_size,
+        num_workers=args.num_dataloader_workers, pin_memory=True)
+    test_dataloader = DataLoader(
+        datasets['test'], batch_size=args.batch_size,
+        num_workers=args.num_dataloader_workers, pin_memory=True)
+    return datasets, train_dataloader, val_dataloader, test_dataloader
+
 
 
 def setup_for_run(args):
     # Make run_dir if it doesn't exist.
-    if not os.path.exists(args.run_dir): 
-        os.mkdir(os.path.abspath(args.run_dir))
-    elif not args.do_overwrite:
-        raise ValueError("Save dir %s exists and overwrite is not enabled!" % args.run_dir)
+    # if not os.path.exists(args.run_dir): 
+    #     os.mkdir(os.path.abspath(args.run_dir))
+    # elif not args.do_overwrite:
+    #     raise ValueError("Save dir %s exists and overwrite is not enabled!" % args.run_dir)
+    os.makedirs(os.path.abspath(args.run_dir), exist_ok=True)
 
     args.to_json_file(os.path.join(args.run_dir, ARGS_FILENAME))
 
     return setup_datasets_and_dataloaders(args)
 
-def main(args, tqdm):
+def run_main(args, tqdm):
     ### SEED EVERYTHING HERE ###
     random.seed(0)
     torch.manual_seed(0)

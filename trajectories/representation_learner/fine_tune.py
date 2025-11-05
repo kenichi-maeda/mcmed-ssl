@@ -7,6 +7,7 @@ import torch
 import torch.optim
 from torch.autograd import set_detect_anomaly
 from torch.utils.data import DataLoader, RandomSampler, SubsetRandomSampler
+from .mcmed_dataset import PatientDataset
 
 import numpy as np
 
@@ -22,6 +23,151 @@ from .args import Args
 
 from .meta_model import *
 from .run_model import setup_datasets_and_dataloaders, train_meta_model, evaluate_model
+
+def build_ft_datasets(pretrain_run_dir, base_dir, parquet_path):
+    # paths for MC-MED official splits
+    split_map = {
+        "train": "split_random_train.csv",
+        "val":   "split_random_val.csv",
+        "test":  "split_random_test.csv",
+    }
+
+    # where we’ll save/load structured normalization for FT
+    ft_root = os.path.join(pretrain_run_dir, "ed_dispo", "FTF")  # matches below
+    os.makedirs(ft_root, exist_ok=True)
+    norm_path = os.path.join(ft_root, "norm_struct.json")
+
+    ds_train = PatientDataset(
+        task="ed_dispo",
+        parquet_path=parquet_path,
+        base_dir=base_dir,
+        use_splits=split_map["train"],
+        split="train",
+        # labels
+        label_source_csv="visits.csv",
+        # structured normalization: compute+save on train
+        standardize_structured=True,
+        norm_json=norm_path,
+        save_norm_stats=True,
+        # signals
+        modality="Pleth",
+        signal_seconds=10,
+        verbose=False,
+    )
+    # reuse same stats for val/test (no saving here)
+    ds_val = PatientDataset(
+        task="ed_dispo",
+        parquet_path=parquet_path,
+        base_dir=base_dir,
+        use_splits=split_map["val"],
+        split="val",
+        label_source_csv="visits.csv",
+        standardize_structured=True,
+        norm_json=norm_path,
+        save_norm_stats=False,
+        modality="Pleth",
+        signal_seconds=10,
+        verbose=False,
+    )
+    ds_test = PatientDataset(
+        task="ed_dispo",
+        parquet_path=parquet_path,
+        base_dir=base_dir,
+        use_splits=split_map["test"],
+        split="test",
+        label_source_csv="visits.csv",
+        standardize_structured=True,
+        norm_json=norm_path,
+        save_norm_stats=False,
+        modality="Pleth",
+        signal_seconds=10,
+        verbose=False,
+    )
+    return ds_train, ds_val, ds_test
+
+def build_ft_datasets(pretrain_run_dir, base_dir, parquet_path):
+    # paths for MC-MED official splits
+    split_map = {
+        "train": "split_random_train_subset.csv",
+        "val":   "split_random_val_subset.csv",
+        "test":  "split_random_test_subset.csv",
+    }
+
+    # where we’ll save/load structured normalization for FT
+    ft_root = os.path.join(pretrain_run_dir, "ed_dispo", "FTF")  # matches below
+    os.makedirs(ft_root, exist_ok=True)
+    norm_path = os.path.join(ft_root, "norm_struct.json")
+
+    ds_train = PatientDataset(
+        task="ed_dispo",
+        parquet_path=parquet_path,
+        base_dir=base_dir,
+        use_splits=split_map["train"],
+        split="train",
+        # labels
+        label_source_csv="visits.csv",
+        # structured normalization: compute+save on train
+        standardize_structured=True,
+        norm_json=norm_path,
+        save_norm_stats=True,
+        # signals
+        modality="Pleth",
+        signal_seconds=10,
+        verbose=False,
+    )
+    # reuse same stats for val/test (no saving here)
+    ds_val = PatientDataset(
+        task="ed_dispo",
+        parquet_path=parquet_path,
+        base_dir=base_dir,
+        use_splits=split_map["val"],
+        split="val",
+        label_source_csv="visits.csv",
+        standardize_structured=True,
+        norm_json=norm_path,
+        save_norm_stats=False,
+        modality="Pleth",
+        signal_seconds=10,
+        verbose=False,
+    )
+    ds_test = PatientDataset(
+        task="ed_dispo",
+        parquet_path=parquet_path,
+        base_dir=base_dir,
+        use_splits=split_map["test"],
+        split="test",
+        label_source_csv="visits.csv",
+        standardize_structured=True,
+        norm_json=norm_path,
+        save_norm_stats=False,
+        modality="Pleth",
+        signal_seconds=10,
+        verbose=False,
+    )
+    return ds_train, ds_val, ds_test
+
+def ft_collate(batch):
+    # default_collate for tensor fields, drop metadata fields that break collation
+    keep = {
+        "signals_timeseries1","signals_timeseries2","signals_timeseries",
+        "structured_timeseries1","structured_timeseries2",
+        "statics1","statics2","ed_dispo"
+    }
+    out = {k: [] for k in keep}
+    end_idx_list = []
+    for b in batch:
+        for k in list(b.keys()):
+            if k in keep:
+                out[k].append(b[k])
+        end_idx_list.append(b["end_idx"])
+    # stack tensors
+    for k in out:
+        out[k] = torch.stack(out[k], dim=0)
+
+    out["structured_timeseries"] = out["structured_timeseries1"]
+    out["statics"] = out["statics1"]
+    out["end_idx"] = torch.tensor(end_idx_list, dtype=torch.long)
+    return out
 
 
 def fine_tune_model(
@@ -98,10 +244,11 @@ def fine_tune_model(
 
             # --- save metrics & preds for FTD ---
             save_dir = meta_model_FTD_args.run_dir
-            val_auc = eval_results["val"].get("example_task_auc", None)
-            val_auprc = eval_results["val"].get("example_task_auprc", None)
-            test_auc = eval_results["test"].get("example_task_auc", None)
-            test_auprc = eval_results["test"].get("example_task_auprc", None)
+            TASK = fine_tune_args.task
+            val_auc = eval_results["val"].get(f"{TASK}_auc")
+            val_auprc = eval_results["val"].get(f"{TASK}_auprc")
+            test_auc = eval_results["test"].get(f"{TASK}_auc")
+            test_auprc = eval_results["test"].get(f"{TASK}_auprc")
             ft_metrics = {
                 "strategy": "FTD",
                 "val_auc": float(val_auc) if val_auc is not None else None,
@@ -137,10 +284,11 @@ def fine_tune_model(
 
             # --- save metrics & preds for FTF ---
             save_dir = meta_model_FTF_args.run_dir
-            val_auc = eval_results["val"].get("example_task_auc", None)
-            val_auprc = eval_results["val"].get("example_task_auprc", None)
-            test_auc = eval_results["test"].get("example_task_auc", None)
-            test_auprc = eval_results["test"].get("example_task_auprc", None)
+            TASK = fine_tune_args.task
+            val_auc = eval_results["val"].get(f"{TASK}_auc")
+            val_auprc = eval_results["val"].get(f"{TASK}_auprc")
+            test_auc = eval_results["test"].get(f"{TASK}_auc")
+            test_auprc = eval_results["test"].get(f"{TASK}_auprc")
             ft_metrics = {
                 "strategy": "FTF",
                 "val_auc": float(val_auc) if val_auc is not None else None,
@@ -183,6 +331,9 @@ def main(fine_tune_args, tqdm):
 
     meta_model_args = Args.from_json_file(os.path.join(fine_tune_args.run_dir, ARGS_FILENAME))
     
+    meta_model_args.run_dir = fine_tune_args.run_dir
+    assert os.path.isdir(meta_model_args.run_dir), meta_model_args.run_dir
+
     print('Disabling contrastive learning for fine tuning!')
     meta_model_args.do_simclr = False
     meta_model_args.do_vicreg = False
@@ -192,14 +343,38 @@ def main(fine_tune_args, tqdm):
     meta_model_args.batch_size = fine_tune_args.batch_size
     meta_model_args.epochs = fine_tune_args.epochs
     meta_model_args.signal_seconds = fine_tune_args.signal_seconds
+
+    BASE_DIR   = "physionet.org/files/mc-med/1.0.1/data"
+    PARQUET    = "aligned_out/aligned_hours.parquet"
         
-    datasets, train_dataloader, val_dataloader, test_dataloader = setup_datasets_and_dataloaders(meta_model_args, 
-                                                                                                 task=fine_tune_args.task)
+    # datasets, train_dataloader, val_dataloader, test_dataloader = setup_datasets_and_dataloaders(meta_model_args, 
+    # assert datasets['train'].max_seq_len == meta_model_args.max_seq_len
+    # assert train_dataloader.dataset.max_seq_len == meta_model_args.max_seq_len
+    # sample_datum = datasets['train'][0]
+                      
+    ds_train, ds_val, ds_test = build_ft_datasets(
+        pretrain_run_dir=fine_tune_args.run_dir,
+        base_dir=BASE_DIR,
+        parquet_path=PARQUET,
+    )
 
-    assert datasets['train'].max_seq_len == meta_model_args.max_seq_len
-    assert train_dataloader.dataset.max_seq_len == meta_model_args.max_seq_len
+    train_dataloader = DataLoader(
+        ds_train, batch_size=meta_model_args.batch_size,
+        num_workers=meta_model_args.num_dataloader_workers,
+        pin_memory=True, shuffle=True, collate_fn=ft_collate
+    )
+    val_dataloader = DataLoader(
+        ds_val, batch_size=meta_model_args.batch_size,
+        num_workers=meta_model_args.num_dataloader_workers,
+        pin_memory=True, shuffle=False, collate_fn=ft_collate
+    )
+    test_dataloader = DataLoader(
+        ds_test, batch_size=meta_model_args.batch_size,
+        num_workers=meta_model_args.num_dataloader_workers,
+        pin_memory=True, shuffle=False, collate_fn=ft_collate
+    )                                                                    
 
-    sample_datum = datasets['train'][0]
+    sample_datum = ds_train[0] 
 
     # NOTE: this could be extended to support dataloaders of different size
     train_dataloaders_by_data_frac = {1: train_dataloader}

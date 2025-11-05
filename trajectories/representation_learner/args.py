@@ -150,6 +150,15 @@ class Args(BaseArgs):
     # Dataset control (virtual length = windows per epoch)
     train_windows_per_epoch: int = 20000
 
+    # --- Dataset I/O (SSL/pretraining) ---
+    parquet_path:        str = "../aligned_out/aligned_hours.parquet"
+    use_splits_train:    str = "split_random_train_subset.csv"
+    use_splits_val:      str = "split_random_val_subset.csv"
+    use_splits_test:     str = "split_random_test_subset.csv"   # not used in SSL usually, but handy to have
+    modality:            str = "Pleth"
+    ssl_stride:          int = 8                          # non-overlapping 8-hr windows for SSL
+
+
     @classmethod
     def _build_argparse_spec(cls, parser):
         # Configuration (do not change)
@@ -219,6 +228,20 @@ class Args(BaseArgs):
         parser.add_argument('--fc_layer_sizes', type=int, nargs='+', default=(256,), help='cnn fc stack')
         parser.add_argument('--frac_data', type=float, default=1.0, help='# dataloader workers.')
 
+        parser.add_argument('--parquet_path', type=str, required=True,
+                    help='Path to the hourly-aligned parquet (one row per visit-hour).')
+        parser.add_argument('--use_splits_train', type=str, required=True,
+                            help='CSV of CSNs for train split (one CSN per line).')
+        parser.add_argument('--use_splits_val', type=str, required=True,
+                            help='CSV of CSNs for val/tuning split.')
+        parser.add_argument('--use_splits_test', type=str, default=None,
+                            help='CSV of CSNs for test split (optional for SSL).')
+        parser.add_argument('--modality', type=str, default='Pleth',
+                            choices=['Pleth'], help='Signal modality to use (Pleth wired).')
+        parser.add_argument('--ssl_stride', type=int, default=8,
+                            help='Step between starting hours when building SSL windows (8 = non-overlap).')
+
+
         # Debug
         parser.add_argument('--do_test_run', action='store_true', default=False, help='Will use small dataset. Faster runtime.')
         parser.add_argument('--do_detect_anomaly', action='store_true', default=False, help='Will detect nans. Slower runtime.')
@@ -255,6 +278,23 @@ class FineTuneArgs(BaseArgs):
     # Task
     task:                   str = 'example_task'
 
+    # --- Dataset I/O (FT) ---
+    parquet_path:        str = "aligned_out/aligned_hours.parquet"
+    use_splits_train:    str = "split_random_train_subset.csv"
+    use_splits_val:      str = "split_random_val_subset.csv"
+    use_splits_test:     str = "split_random_test_subset.csv"
+    modality:            str = "Pleth"
+
+    # Window lengths for FT (often same as SSL)
+    min_seq_len:         int = 8
+    max_seq_len:         int = 8
+    eval_seq_len:        int = 8
+
+    # --- Normalization for FT structured/statics ---
+    norm_json:                 str = "./norm_stats.json"  # where to save/load struct stats from train
+    standardize_structured:    bool = True
+    standardize_statics:       bool = False
+
     @classmethod
     def _build_argparse_spec(cls, parser):
         parser.add_argument(
@@ -279,5 +319,30 @@ class FineTuneArgs(BaseArgs):
         # SSL parameters
         parser.add_argument('--do_simclr', action='store_true', default=False)
         parser.add_argument('--do_vicreg', action='store_true', default=False)
+
+        # Dataset I/O
+        parser.add_argument('--parquet_path', type=str, required=True,
+                            help='Path to the hourly-aligned parquet.')
+        parser.add_argument('--use_splits_train', type=str, required=True,
+                            help='CSV of CSNs for FT train split.')
+        parser.add_argument('--use_splits_val', type=str, required=True,
+                            help='CSV of CSNs for FT val split.')
+        parser.add_argument('--use_splits_test', type=str, required=True,
+                            help='CSV of CSNs for FT test split.')
+        parser.add_argument('--modality', type=str, default='Pleth',
+                            choices=['Pleth'], help='Signal modality to use.')
+
+        # Window lengths
+        parser.add_argument('--min_seq_len', type=int, default=8)
+        parser.add_argument('--max_seq_len', type=int, default=8)
+        parser.add_argument('--eval_seq_len', type=int, default=8)
+
+        # Normalization
+        parser.add_argument('--norm_json', type=str, default='./norm_stats.json',
+                            help='Where to save (train) / load (val/test) structured normalization stats.')
+        parser.add_argument('--standardize_structured', action='store_true', default=True)
+        parser.add_argument('--no_standardize_structured', dest='standardize_structured', action='store_false')
+        parser.add_argument('--standardize_statics', action='store_true', default=False)
+        parser.add_argument('--no_standardize_statics', dest='standardize_statics', action='store_false')
 
         return 'run_dir', FINE_TUNE_ARGS_FILENAME
